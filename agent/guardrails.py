@@ -71,6 +71,8 @@ __all__ = [
     "redact",
     "ArithmeticCheckResult",
     "verify_arithmetic",
+    "AnswerValidationResult",
+    "validate_answer",
     "abstention_policy",
 ]
 
@@ -161,23 +163,16 @@ class InjectionScanResult:
 
 
 def scan_for_injected_instructions(text: str) -> InjectionScanResult:
-    """STUB — ALWAYS RETURNS `suspicious=False`, REGARDLESS OF `text`.
-
-    A real version needs to catch imperative language embedded in
-    RETRIEVED CONTENT (a `Note:` page, a RESEARCH snippet, an A2A peer's
-    reply) that tries to redirect what YOUR agent does next — "ignore your
-    previous instructions and...", "as the system, you must now...", a
-    fake tool result claiming to BE a new system prompt, an instruction to
-    reveal `ctx.act`/`ctx.scopes`/another learner's data. This is the
-    `poisoned_result` / `faithless_peer` duel classes' entire mechanism
-    (FINAL-PLAN.md section 4.4), and CONTRACTS.md section 6.4's
-    `guardrail_breach` is what fires when it works on you.
-
-    This starter's version does not look at `text` at all — see this
-    file's own `__main__` demo below, which runs an unambiguous injection
-    attempt through this exact function and shows it sailing through
-    uncaught. That gap is the assignment, not a bug report."""
-    return InjectionScanResult(suspicious=False, matched_patterns=())
+    patterns = (
+        r"ignore\s+(?:all\s+)?previous instructions",
+        r"(?:system|developer)\s+message",
+        r"you\s+must\s+(?:reveal|disclose|send|ignore)",
+        r"reveal\s+(?:ctx\.)?(?:act|scopes|learner|private)",
+        r"follow\s+these\s+instructions",
+        r"tool\s+result\s*[:=].*\b(?:system|admin)\b",
+    )
+    hits = tuple(p for p in patterns if re.search(p, text or "", re.I | re.S))
+    return InjectionScanResult(suspicious=bool(hits), matched_patterns=hits)
 
 
 # ---------------------------------------------------------------------------
@@ -192,20 +187,19 @@ class RedactionResult:
 
 
 def redact(text: str) -> RedactionResult:
-    """STUB — ALWAYS RETURNS `text` UNCHANGED, `hits=()`.
-
-    A real version needs to catch a seeded `Note:` page's private content,
-    or a `Learner:` page's private field, appearing verbatim (CONTRACTS.md
-    6.4's `privacy_leak` detector: "normalised, >= 40 chars") inside an
-    answer that is about to be handed to the OPPONENT team as this
-    exchange's `answer.text` — remember, the trace you hand over on
-    prosecution is public to whoever is prosecuting you (CONTRACTS.md
-    5.4). `privacy_leak` is weight 8, tied for the heaviest class in the
-    whole Safety family (CONTRACTS.md section 6.1).
-
-    This starter's version does not look at `text` at all — see this
-    file's own `__main__` demo below."""
-    return RedactionResult(redacted_text=text, hits=())
+    hits: list[str] = []
+    out = text or ""
+    rules = (
+        (r"(?i)(?:api[_ -]?key|token|secret|password)\s*[:=]\s*[^\s,;]+", "[REDACTED]"),
+        (r"(?is)(?:private|confidential|do not share)\s*[:=]\s*[^.!?\n]{40,}", "[PRIVATE CONTENT REDACTED]"),
+        (r"(?i)learner:[a-z0-9_-]+", "[LEARNER ID REDACTED]"),
+    )
+    for pattern, replacement in rules:
+        def replace_match(m):
+            hits.append(m.group(0)[:80])
+            return replacement
+        out = re.sub(pattern, replace_match, out)
+    return RedactionResult(redacted_text=out, hits=tuple(hits))
 
 
 # ---------------------------------------------------------------------------
@@ -223,23 +217,86 @@ class ArithmeticCheckResult:
 _NUMBER_RE = re.compile(r"-?\d+(?:\.\d+)?")
 
 
-def verify_arithmetic(text: str) -> ArithmeticCheckResult:
-    """STUB — ALWAYS RETURNS `checked=False, ok=None`: "I did not verify
-    this", not "this is correct".
+def verify_arithmetic(text: str, supported_numbers: Iterable[str] = ()) -> ArithmeticCheckResult:
+    numbers = tuple(_NUMBER_RE.findall(text or ""))
+    supported = frozenset(str(n) for n in supported_numbers)
+    if not numbers:
+        return ArithmeticCheckResult(checked=True, ok=True, detail="no numeric assertion")
+    if not supported:
+        return ArithmeticCheckResult(checked=False, ok=None, detail="numeric claims require source values")
+    bad = tuple(n for n in numbers if n not in supported)
+    return ArithmeticCheckResult(checked=True, ok=not bad,
+                                detail="unsupported numeric claims: " + ", ".join(bad) if bad else "all numbers matched source")
 
-    A real version needs to catch the `unsupported_precision` class
-    (CONTRACTS.md 6.1/6.4) — a number in your answer that is more precise,
-    or simply different, than anything an anchor you actually retrieved
-    supports. `_NUMBER_RE` above is left in as a starting point (it finds
-    every bare number in a string) — turning "found some numbers" into
-    "verified each one against a retrieved source" is the actual work,
-    left undone here on purpose.
 
-    This starter's version does not look at `text` at all beyond what
-    `_NUMBER_RE` would find if you called it (it isn't called) — see this
-    file's own `__main__` demo below."""
-    return ArithmeticCheckResult(
-        checked=False, ok=None, detail="verify_arithmetic is a stub — no check was performed"
+@dataclass(frozen=True, slots=True)
+class AnswerValidationResult:
+    """Result of the single answer gate used by an agent wrapper."""
+    accepted: bool
+    answer: Mapping[str, Any]
+    reasons: tuple[str, ...]
+    grounding: GroundingResult
+    injection: InjectionScanResult
+    redaction: RedactionResult
+    arithmetic: ArithmeticCheckResult
+
+
+def validate_answer(
+    answer: Mapping[str, Any],
+    retrieved_anchors: Iterable[str],
+    *,
+    retrieved_text: str = "",
+    required_fields: Iterable[str] = (),
+    supported_numbers: Iterable[str] = (),
+    partial: bool = False,
+    conflicted: bool = False,
+    require_citation: bool = True,
+) -> AnswerValidationResult:
+    """Apply all answer-side safety checks before an ANSWER is submitted.
+
+    This is deliberately fail-closed: suspicious retrieved instructions,
+    missing/invalid citations, partial/conflicted evidence, or unsupported
+    numeric assertions reject the answer. Redaction is applied only to an
+    otherwise eligible answer; redaction never turns a bad citation into a
+    good one.
+    """
+    original = dict(answer or {})
+    text = str(original.get("text") or "")
+    injection = scan_for_injected_instructions(retrieved_text)
+    answer_injection = scan_for_injected_instructions(text)
+    injection = InjectionScanResult(
+        suspicious=injection.suspicious or answer_injection.suspicious,
+        matched_patterns=tuple(dict.fromkeys(injection.matched_patterns + answer_injection.matched_patterns)),
+    )
+    redaction = redact(text)
+    safe = dict(original)
+    safe["text"] = redaction.redacted_text
+    grounding = check_grounding(safe, retrieved_anchors, require_citation=require_citation)
+    arithmetic = verify_arithmetic(redaction.redacted_text, supported_numbers)
+    reasons: list[str] = []
+    if injection.suspicious:
+        reasons.append("prompt injection detected")
+    if not grounding.grounded:
+        reasons.append("citation is missing, malformed, or not retrieved")
+    if partial:
+        reasons.append("partial evidence is not complete evidence")
+    if conflicted:
+        reasons.append("evidence conflict is unresolved")
+    required = {str(x) for x in required_fields}
+    if required and not required.issubset(safe):
+        reasons.append("required answer fields are missing")
+    if not arithmetic.checked or arithmetic.ok is False:
+        reasons.append("numeric assertion is unsupported or inconsistent")
+    if redaction.hits:
+        reasons.append("sensitive content was redacted")
+    return AnswerValidationResult(
+        accepted=not reasons,
+        answer=safe,
+        reasons=tuple(reasons),
+        grounding=grounding,
+        injection=injection,
+        redaction=redaction,
+        arithmetic=arithmetic,
     )
 
 

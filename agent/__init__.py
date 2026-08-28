@@ -30,6 +30,7 @@ from __future__ import annotations
 from agent.gateway import Command, Decision, Gateway, GatewayContext
 from agent.guardrails import (
     ArithmeticCheckResult,
+    AnswerValidationResult,
     GroundingResult,
     InjectionScanResult,
     RedactionResult,
@@ -38,6 +39,7 @@ from agent.guardrails import (
     redact,
     scan_for_injected_instructions,
     verify_arithmetic,
+    validate_answer,
 )
 from agent.strategy import (
     BudgetPacer,
@@ -68,6 +70,8 @@ __all__ = [
     "redact",
     "ArithmeticCheckResult",
     "verify_arithmetic",
+    "AnswerValidationResult",
+    "validate_answer",
     "abstention_policy",
     # strategy.py
     "BudgetPacer",
